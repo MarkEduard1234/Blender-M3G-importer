@@ -8,6 +8,7 @@ I have not yet tested it as a standalone script, and probably won't do that anyw
 **Tested Games (only J2ME)(Will maybe get fixed soon):**
 Asphalt Urban GT 3D✅
 Siemens 3D Rally✅
-3D Rally Evolution✅
+Rally Evolution 3D✅
+Coast Cruiser 3D✅
 Galaxy On Fire 3D❌
 Burning Tires❌

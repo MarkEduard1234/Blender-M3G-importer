@@ -14,3 +14,4 @@ Galaxy On Fire 3D✅
 Burning Tires✅
 Air Buster 3D✅
 Colin McRae - DiRT 3D✅
+The Fast and The Furious - Pink Slip 3D✅

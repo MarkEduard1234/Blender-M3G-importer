@@ -4,14 +4,16 @@
 #
 # Imports: scene graph (World/Group), meshes (triangle strips, all vertex array
 # encodings), normals, UVs, vertex colors, materials, textures (Image2D),
-# cameras, lights.
-# Not imported: animation, skinning/morph targets (mesh imported as static base
-# shape), fog, background, sprites (empty), ambient light (empty).
+# cameras, lights, animation (node transforms, camera FOV/clip, light color/
+# intensity/spot angle, background crop/color), world background (color + image,
+# screen-space), external files next to the .m3g, scrambled files.
+# Not imported: skinning/morph targets (mesh imported as static base shape),
+# fog, material/texture animation, sprites (empty), ambient light (empty).
 
 bl_info = {
     "name": "M3G (JSR-184) Importer",
     "author": "Claude",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 5, 0),
     "location": "File > Import > M3G (.m3g)",
     "description": "Import Mobile 3D Graphics (.m3g) files",
@@ -49,6 +51,27 @@ T_SPRITE = 18
 T_VERTEX_ARRAY = 20
 T_VERTEX_BUFFER = 21
 T_WORLD = 22
+T_CONTROLLER = 1
+T_TRACK = 2
+T_BACKGROUND = 4
+T_KEYFRAMES = 19
+T_EXTERNAL = 255
+
+# Animation property ids
+P_COLOR = 258
+P_CROP = 259
+P_FAR = 263
+P_FOV = 264
+P_INTENSITY = 265
+P_NEAR = 267
+P_ORIENTATION = 268
+P_SCALE = 270
+P_SPOT_ANGLE = 273
+P_TRANSLATION = 275
+TRS_PROPS = (P_ORIENTATION, P_SCALE, P_TRANSLATION)
+
+# Keyframe interpolation -> Blender (SLERP/SQUAD approximated by linear + normalize)
+INTERP = {176: 'LINEAR', 177: 'LINEAR', 178: 'BEZIER', 179: 'LINEAR', 180: 'CONSTANT'}
 
 NODE_TYPES = {T_CAMERA, T_GROUP, T_LIGHT, T_MESH, T_MORPHING_MESH,
               T_SKINNED_MESH, T_SPRITE, T_WORLD}
@@ -88,6 +111,9 @@ class Reader:
 
     def u32(self):
         return self._take("<I", 4)
+
+    def i32(self):
+        return self._take("<i", 4)
 
     def f32(self):
         return self._take("<f", 4)
@@ -146,15 +172,18 @@ class Reader:
 # Object parsers
 # ---------------------------------------------------------------------------
 
-def _object3d(r):
+def _object3d(r, d=None):
     uid = r.u32()                 # userID
-    for _ in range(r.u32()):      # animation tracks (not imported)
-        r.u32()
+    n = r.u32()
+    tracks = [r.u32() for _ in range(n)]
     params = []
     for _ in range(r.u32()):      # user parameters
         pid = r.u32()
         params.append((pid, r.raw(r.u32())))
-    return uid, params
+    if d is not None:
+        d["uid"] = uid
+        d["tracks"] = tracks
+        d["params"] = params
 
 
 def param_text(val):
@@ -165,7 +194,7 @@ def param_text(val):
 
 
 def _transformable(r, d):
-    d["uid"], d["params"] = _object3d(r)
+    _object3d(r, d)
     d["T"] = (0.0, 0.0, 0.0)
     d["S"] = (1.0, 1.0, 1.0)
     d["R"] = None
@@ -251,7 +280,7 @@ def _h_light(r, d):
 
 
 def _h_appearance(r, d):
-    _object3d(r)
+    _object3d(r, d)
     r.u8()                        # layer
     d["compositing"] = r.u32()
     d["fog"] = r.u32()
@@ -262,7 +291,7 @@ def _h_appearance(r, d):
 
 
 def _h_material(r, d):
-    _object3d(r)
+    _object3d(r, d)
     r.rgb()                       # ambient
     d["diffuse"] = r.rgba()
     d["emissive"] = r.rgb()
@@ -272,7 +301,7 @@ def _h_material(r, d):
 
 
 def _h_polygon_mode(r, d):
-    _object3d(r)
+    _object3d(r, d)
     d["culling"] = r.u8()
     d["shading"] = r.u8()
     d["winding"] = r.u8()
@@ -282,7 +311,7 @@ def _h_polygon_mode(r, d):
 
 
 def _h_compositing(r, d):
-    _object3d(r)
+    _object3d(r, d)
     r.boolean()
     r.boolean()
     r.boolean()
@@ -305,7 +334,7 @@ def _h_texture2d(r, d):
 
 
 def _h_image2d(r, d):
-    _object3d(r)
+    _object3d(r, d)
     d["format"] = r.u8()
     d["mutable"] = r.boolean()
     d["width"] = r.u32()
@@ -318,7 +347,7 @@ def _h_image2d(r, d):
 
 
 def _h_vertex_array(r, d):
-    _object3d(r)
+    _object3d(r, d)
     csize = r.u8()
     ccount = r.u8()
     enc = r.u8()
@@ -338,7 +367,7 @@ def _h_vertex_array(r, d):
 
 
 def _h_vertex_buffer(r, d):
-    _object3d(r)
+    _object3d(r, d)
     d["default_color"] = r.rgba()
     d["positions"] = r.u32()
     d["pbias"] = r.vec3()
@@ -356,7 +385,7 @@ def _h_vertex_buffer(r, d):
 
 
 def _h_strip_array(r, d):
-    _object3d(r)
+    _object3d(r, d)
     enc = r.u8()
     first = 0
     explicit = None
@@ -380,6 +409,65 @@ def _h_strip_array(r, d):
     d["lengths"] = lengths
 
 
+def _h_background(r, d):
+    _object3d(r, d)
+    d["color"] = r.rgba()
+    d["image"] = r.u32()
+    d["mode_x"] = r.u8()
+    d["mode_y"] = r.u8()
+    d["crop"] = (r.i32(), r.i32(), r.i32(), r.i32())
+    d["depth_clear"] = r.boolean()
+    d["color_clear"] = r.boolean()
+
+
+def _h_controller(r, d):
+    _object3d(r, d)
+    d["speed"] = r.f32()
+    d["weight"] = r.f32()
+    r.i32()                       # active interval start (ignored)
+    r.i32()                       # active interval end (ignored)
+    d["refseq"] = r.f32()
+    d["refworld"] = r.i32()
+
+
+def _h_track(r, d):
+    _object3d(r, d)
+    d["seq"] = r.u32()
+    d["ctrl"] = r.u32()
+    d["prop"] = r.u32()
+
+
+def _h_keyframes(r, d):
+    _object3d(r, d)
+    d["interp"] = r.u8()
+    d["repeat"] = r.u8()
+    enc = r.u8()
+    d["duration"] = r.u32()
+    d["first"] = r.u32()
+    d["last"] = r.u32()
+    cc = r.u32()
+    kc = r.u32()
+    if cc < 1 or cc > 64 or enc not in (0, 1, 2) or kc * 4 > r.end - r.pos:
+        raise M3GError("bad keyframe sequence")
+    times = np.empty(kc, dtype=np.int64)
+    vals = np.empty((kc, cc), dtype=np.float64)
+    if enc == 0:
+        for i in range(kc):
+            times[i] = r.u32()
+            vals[i] = r.floats(cc)
+    else:
+        bias = np.array(r.floats(cc), dtype=np.float64)
+        scale = np.array(r.floats(cc), dtype=np.float64)
+        for i in range(kc):
+            times[i] = r.u32()
+            if enc == 1:
+                vals[i] = bias + scale * (r.np_array("u1", cc) / 255.0)
+            else:
+                vals[i] = bias + scale * (r.np_array("<u2", cc) / 65535.0)
+    d["times"] = times
+    d["values"] = vals
+
+
 HANDLERS = {
     T_APPEARANCE: _h_appearance,
     T_CAMERA: _h_camera,
@@ -399,6 +487,10 @@ HANDLERS = {
     T_VERTEX_BUFFER: _h_vertex_buffer,
     T_WORLD: _h_world,
     255: _h_external,
+    T_CONTROLLER: _h_controller,
+    T_TRACK: _h_track,
+    T_BACKGROUND: _h_background,
+    T_KEYFRAMES: _h_keyframes,
 }
 
 
@@ -406,16 +498,109 @@ HANDLERS = {
 # File container
 # ---------------------------------------------------------------------------
 
+def _section_chain(get, n):
+    """Cheap structural check of a (virtual) byte stream get(i), length n:
+    signature, then sections / uncompressed objects must chain exactly."""
+    for i in range(12):
+        if get(i) != M3G_MAGIC[i]:
+            return False
+    pos = 12
+    while pos < n:
+        if pos + 13 > n:
+            return False
+        comp = get(pos)
+        total = get(pos + 1) | get(pos + 2) << 8 | get(pos + 3) << 16 | get(pos + 4) << 24
+        if comp > 1 or total < 13 or pos + total > n:
+            return False
+        if comp == 0:
+            p = pos + 9
+            end = pos + total - 4
+            while p < end:
+                if p + 5 > end:
+                    return False
+                t = get(p)
+                ln = get(p + 1) | get(p + 2) << 8 | get(p + 3) << 16 | get(p + 4) << 24
+                if (t > 22 and t != 255) or p + 5 + ln > end:
+                    return False
+                p += 5 + ln
+        pos += total
+    return pos == n
+
+
+def _checksums_ok(d):
+    """Adler32 of every uncompressed section, zlib check for compressed ones."""
+    if d[:12] != M3G_MAGIC:
+        return False
+    pos = 12
+    n = len(d)
+    while pos < n:
+        if pos + 13 > n:
+            return False
+        comp = d[pos]
+        total, ulen = struct.unpack_from("<II", d, pos + 1)
+        if total < 13 or pos + total > n:
+            return False
+        if comp == 0:
+            stored = struct.unpack_from("<I", d, pos + total - 4)[0]
+            if (zlib.adler32(d[pos:pos + total - 4]) & 0xFFFFFFFF) != stored:
+                return False
+        else:
+            try:
+                if len(zlib.decompress(d[pos + 9:pos + total - 4])) != ulen:
+                    return False
+            except zlib.error:
+                return False
+        pos += total
+    return True
+
+
+M3G_SCRAMBLE_MAX = 8192
+
+
+def deobfuscate(data):
+    """Returns (data, note). Handles: plain files, junk before the signature,
+    fully byte-reversed files, and files whose first/last K bytes were swapped
+    and byte-reversed (K differs per file)."""
+    n = len(data)
+    if data[:12] == M3G_MAGIC:
+        return data, None
+    i = data.find(M3G_MAGIC, 0, 4096)
+    if i > 0:
+        return data[i:], "skipped %d bytes before the JSR184 signature" % i
+    cand = data[::-1]
+    if _checksums_ok(cand):
+        return cand, "file was stored byte-reversed; restored"
+    for K in range(1, min(n // 2, M3G_SCRAMBLE_MAX) + 1):
+        def get(i, K=K):
+            return data[n - 1 - i] if (i < K or i >= n - K) else data[i]
+        if _section_chain(get, n):
+            cand = data[n - K:][::-1] + data[K:n - K] + data[:K][::-1]
+            if _checksums_ok(cand):
+                return cand, "file head/tail was scrambled (%d bytes); restored" % K
+    return data, None
+
+
 class M3GFile:
-    def __init__(self, data):
+    def __init__(self, data, path=None, shared=None, allow_external=True):
         self.objects = {}         # index -> (type, bytes)
         self.parsed = {}
-        self.warnings = []
+        self.path = path
+        self.allow_external = allow_external
+        self._shared = shared if shared is not None else {"files": {}, "warnings": [], "notes": []}
+        self.warnings = self._shared["warnings"]
+        self.notes = self._shared["notes"]
+        self._ext = {}            # external ref index -> M3GFile or None
         self._load(data)
+        if path:
+            self._shared["files"][os.path.normcase(os.path.abspath(path))] = self
 
     def _load(self, data):
+        data, note = deobfuscate(data)
+        if note:
+            self.notes.append(note)
         if data[:12] != M3G_MAGIC:
-            raise M3GError("Not an M3G file (bad JSR184 signature)")
+            raise M3GError("Not an M3G file (no JSR184 signature, also tried "
+                           "reversed and head/tail-scrambled layouts)")
         n = len(data)
         pos = 12
         index = 1                 # header object is index 1
@@ -480,6 +665,96 @@ class M3GFile:
             return {"type": -1}
         return d
 
+    # ---- external references ------------------------------------------
+
+    def _find_external(self, uri):
+        if not self.path or "://" in uri:
+            return None
+        name = uri.split("#")[0].replace("\\", "/").lstrip("/")
+        if not name:
+            return None
+        base = os.path.dirname(os.path.abspath(self.path))
+        cand = os.path.normpath(os.path.join(base, name))
+        try:
+            inside = os.path.commonpath([base, cand]) == base
+        except ValueError:
+            inside = False
+        if inside and os.path.isfile(cand):
+            return cand
+        bn = os.path.basename(name).lower()
+        try:
+            for fn in os.listdir(base):
+                full = os.path.join(base, fn)
+                if fn.lower() == bn and os.path.isfile(full):
+                    return full
+        except OSError:
+            pass
+        return None
+
+    def _external(self, idx):
+        """Loaded M3GFile for external reference object idx, or None."""
+        if idx in self._ext:
+            return self._ext[idx]
+        if not self.allow_external:
+            return None
+        self._ext[idx] = None
+        d = self.get(idx, T_EXTERNAL)
+        if d is None:
+            return None
+        path = self._find_external(d["uri"])
+        if path is None:
+            self.warnings.append("External file not found next to the .m3g: %s" % d["uri"])
+            return None
+        key = os.path.normcase(os.path.abspath(path))
+        other = self._shared["files"].get(key)
+        if other is None:
+            if len(self._shared["files"]) >= 64:
+                self.warnings.append("Too many external files, skipped %s" % d["uri"])
+                return None
+            try:
+                with open(path, "rb") as fh:
+                    other = M3GFile(fh.read(), path=path, shared=self._shared)
+            except (OSError, M3GError) as e:
+                self.warnings.append("External file %s unreadable: %s" % (d["uri"], e))
+                return None
+        self._ext[idx] = other
+        return other
+
+    def resolve_image(self, idx):
+        """(M3GFile, index) of the Image2D that object idx stands for."""
+        if not idx or idx not in self.objects:
+            return None
+        t = self.objects[idx][0]
+        if t == T_IMAGE2D:
+            return (self, idx)
+        if t != T_EXTERNAL:
+            return None
+        other = self._external(idx)
+        if other is None:
+            return None
+        for i in sorted(other.objects):
+            if other.objects[i][0] == T_IMAGE2D:
+                return (other, i)
+        self.warnings.append("External file %s contains no image" % self.get(idx)["uri"])
+        return None
+
+    def resolve_node(self, idx):
+        """(M3GFile, index) of the first root scene node of an external file."""
+        other = self._external(idx)
+        if other is None:
+            return None
+        kids = set()
+        for i, (t, _data) in other.objects.items():
+            if t in (T_GROUP, T_WORLD):
+                d = other.get(i)
+                if d is not None and d["type"] in (T_GROUP, T_WORLD):
+                    kids.update(d["children"])
+        for i in sorted(other.objects):
+            if other.objects[i][0] in NODE_TYPES and i not in kids:
+                return (other, i)
+        self.warnings.append("External file %s contains no scene node" % self.get(idx)["uri"])
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -528,6 +803,41 @@ def strip_triangles(indices, lengths, cw, nverts):
     if cw:
         t = t[:, [0, 2, 1]]
     return t
+
+
+def is_identity16(m):
+    return all(abs(m[i] - (1.0 if i % 5 == 0 else 0.0)) < 1e-6 for i in range(16))
+
+
+def qmul(a, b):
+    """Hamilton product of (n,4) quaternion arrays, (w, x, y, z)."""
+    aw, ax, ay, az = a[:, 0], a[:, 1], a[:, 2], a[:, 3]
+    bw, bx, by, bz = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    return np.stack([aw * bw - ax * bx - ay * by - az * bz,
+                     aw * bx + ax * bw + ay * bz - az * by,
+                     aw * by - ax * bz + ay * bw + az * bx,
+                     aw * bz + ax * by - ay * bx + az * bw], axis=1)
+
+
+def socket_index(node, sock):
+    for i, s in enumerate(node.inputs):
+        if s.identifier == sock.identifier:
+            return i
+    raise ValueError("socket not found")
+
+
+def assign_action(idb, action):
+    ad = idb.animation_data
+    if ad is None:
+        ad = idb.animation_data_create()
+    ad.action = action
+    if hasattr(ad, "action_slot") and ad.action_slot is None:
+        slots = getattr(action, "slots", None)
+        if slots is not None and len(slots) > 0:
+            try:
+                ad.action_slot = slots[0]
+            except Exception:
+                pass
 
 
 def find_loose_geometry(m3g):
@@ -593,26 +903,50 @@ def set_poly_prop(mesh, name, values):
 # ---------------------------------------------------------------------------
 
 class Importer:
-    def __init__(self, m3g, context, z_up, scale, name):
+    def __init__(self, m3g, context, z_up, scale, name, parent=None,
+                 import_animation=True, import_background=True):
         self.m3g = m3g
         self.context = context
         self.z_up = z_up
         self.scale = scale
         self.name = name
+        self.do_anim = import_animation
+        self.do_bg = import_background
         # M3G is Y-up, camera looks down -Z. Blender is Z-up. C: (x,y,z)->(x,-z,y)
         self.C = Matrix.Rotation(math.radians(90.0), 4, 'X') if z_up else Matrix.Identity(4)
         self.Ci = self.C.inverted()
-        self.coll = None
+        sc = context.scene
+        self.fps = sc.render.fps / sc.render.fps_base
+        self.frame0 = sc.frame_start
         self.done = set()
         self.node_objs = {}
-        self.created = []
-        self.empties = []
         self.mesh_cache = {}
         self.mat_cache = {}
         self.img_cache = {}
+        self.warned = set()
+        self.bg = None
+        if parent is None:
+            self.depth = 0
+            self.coll = None
+            self.created = []
+            self.empties = []
+            self.subs = []
+            self.anim_state = {"last": 0.0}
+        else:
+            self.depth = parent.depth + 1
+            self.coll = parent.coll
+            self.created = parent.created
+            self.empties = parent.empties
+            self.subs = parent.subs
+            self.anim_state = parent.anim_state
 
     def warn(self, msg):
         self.m3g.warnings.append(msg)
+
+    def warn_once(self, key, msg):
+        if key not in self.warned:
+            self.warned.add(key)
+            self.warn(msg)
 
     # ---- entry ----------------------------------------------------------
 
@@ -638,8 +972,21 @@ class Importer:
             bpy.data.collections.remove(self.coll)
             raise M3GError("No scene nodes found in file")
 
+        if self.do_bg:
+            try:
+                self.setup_background()
+            except Exception as e:
+                self.warn("Background import failed: %s" % e)
+        if self.do_anim:
+            for imp in [self] + list(self.subs):
+                imp.animate_all()
+            last = self.anim_state["last"]
+            if last > 0.0:
+                sc = self.context.scene
+                sc.frame_end = max(sc.frame_end, int(math.ceil(last)))
+
         for idx in sorted(m3g.objects):
-            if m3g.objects[idx][0] == 255:
+            if m3g.objects[idx][0] == 255 and idx not in m3g._ext:
                 d = m3g.get(idx)
                 if d is not None and d["type"] == 255:
                     self.warn("External reference not loaded: %s" % d["uri"])
@@ -677,7 +1024,7 @@ class Importer:
 
     # ---- nodes ----------------------------------------------------------
 
-    def node_matrix(self, d, camera_like=False):
+    def node_matrix(self, d, camera_like=False, skip_m=False):
         T = Matrix.Translation(d["T"])
         R = Matrix.Identity(4)
         if d["R"] is not None:
@@ -687,7 +1034,7 @@ class Importer:
                 R = Matrix.Rotation(math.radians(ang), 4, v.normalized())
         S = Matrix.Diagonal((d["S"][0], d["S"][1], d["S"][2], 1.0))
         L = T @ R @ S
-        if d["M"] is not None:
+        if d["M"] is not None and not skip_m:
             m = d["M"]
             L = L @ Matrix((m[0:4], m[4:8], m[8:12], m[12:16]))
         if self.z_up:
@@ -695,6 +1042,20 @@ class Importer:
             L = (self.C @ L) if camera_like else (self.C @ L @ self.Ci)
         L.translation = L.translation * self.scale
         return L
+
+    def m_conj(self, m):
+        M = Matrix((m[0:4], m[4:8], m[8:12], m[12:16]))
+        if self.z_up:
+            M = self.C @ M @ self.Ci
+        M.translation = M.translation * self.scale
+        return M
+
+    def has_trs_anim(self, d):
+        for tid in d["tracks"]:
+            tr = self.m3g.get(tid, T_TRACK)
+            if tr is not None and tr["prop"] in TRS_PROPS:
+                return True
+        return False
 
     def build_loose(self, loose):
         name = "Mesh_%d" % loose["vb"]
@@ -713,11 +1074,17 @@ class Importer:
         o.empty_display_size = 0.25
         return o
 
-    def build(self, idx, parent):
+    def build(self, idx, parent, parent_inv=None):
         if idx in self.done:
             return
         d = self.m3g.get(idx)
-        if d is None or d["type"] not in NODE_TYPES:
+        if d is None:
+            return
+        if d["type"] == T_EXTERNAL:
+            self.done.add(idx)
+            self.build_external(idx, parent, parent_inv)
+            return
+        if d["type"] not in NODE_TYPES:
             return
         self.done.add(idx)
         t = d["type"]
@@ -743,10 +1110,25 @@ class Importer:
         else:                      # sprite
             obj = self.make_empty("Sprite", idx)
 
+        # Animated node with a general matrix: composite = T R S M. Animation
+        # replaces T/R/S, so M goes into the children's parent-inverse instead.
+        trs_anim = self.do_anim and self.has_trs_anim(d)
+        split_m = bool(trs_anim and d["M"] is not None and not is_identity16(d["M"]))
+        child_pinv = None
+        if split_m:
+            if t in (T_GROUP, T_WORLD):
+                child_pinv = self.m_conj(d["M"])
+            else:
+                self.warn("Node %d: general transform ignored (node is animated)" % idx)
+
         self.coll.objects.link(obj)
         if parent is not None:
             obj.parent = parent
-        obj.matrix_basis = self.node_matrix(d, cam_like)
+            if parent_inv is not None:
+                obj.matrix_parent_inverse = parent_inv
+        if trs_anim:
+            obj.rotation_mode = 'QUATERNION'
+        obj.matrix_basis = self.node_matrix(d, cam_like, skip_m=split_m)
         if d["uid"]:
             obj["m3g_user_id"] = str(d["uid"])     # str: may exceed int32
         for pid, val in d["params"]:
@@ -761,7 +1143,20 @@ class Importer:
 
         if t in (T_GROUP, T_WORLD):
             for c in d["children"]:
-                self.build(c, obj)
+                self.build(c, obj, child_pinv)
+
+    def build_external(self, idx, parent, parent_inv):
+        if self.depth >= 8:
+            self.warn("External references nested too deep, skipped")
+            return
+        ref = self.m3g.resolve_node(idx)
+        if ref is None:
+            return
+        sub = Importer(ref[0], self.context, self.z_up, self.scale, self.name,
+                       parent=self, import_animation=self.do_anim,
+                       import_background=False)
+        self.subs.append(sub)
+        sub.build(ref[1], parent, parent_inv)
 
     # ---- camera / light -------------------------------------------------
 
@@ -989,13 +1384,16 @@ class Importer:
         for unit, ti in enumerate(app["textures"]):
             t = m3g.get(ti, T_TEXTURE2D)
             if t is not None and t["image"]:
-                info = self.get_image(t["image"])
+                ref = m3g.resolve_image(t["image"])
+                info = self.get_image(ref[1], ref[0]) if ref is not None else None
                 if info is not None:
                     found = (unit, t, info)
                     break
         if found is None:
             return
-        unit, t, (img, has_alpha) = found
+        unit, t, info = found
+        img = info["img"]
+        has_alpha = info["alpha"]
 
         uvn = nt.nodes.new("ShaderNodeUVMap")
         uvn.uv_map = uv_name(unit)
@@ -1022,11 +1420,13 @@ class Importer:
         if use_alpha and has_alpha:
             nt.links.new(tex.outputs["Alpha"], bsdf.inputs["Alpha"])
 
-    def get_image(self, idx):
-        if idx in self.img_cache:
-            return self.img_cache[idx]
-        self.img_cache[idx] = None
-        d = self.m3g.get(idx, T_IMAGE2D)
+    def get_image(self, idx, file=None):
+        file = file or self.m3g
+        key = (id(file), idx)
+        if key in self.img_cache:
+            return self.img_cache[key]
+        self.img_cache[key] = None
+        d = file.get(idx, T_IMAGE2D)
         if d is None or d["mutable"]:
             return None
         fmt = d["format"]
@@ -1079,9 +1479,318 @@ class Importer:
         except Exception as e:
             self.warn("Image %d: could not create (%s)" % (idx, e))
             return None
-        res = (img, fmt in (96, 98, 100))
-        self.img_cache[idx] = res
+        res = {"img": img, "alpha": fmt in (96, 98, 100), "w": w, "h": h}
+        self.img_cache[key] = res
         return res
+
+    # ---- world background -------------------------------------------------
+
+    def setup_background(self):
+        """M3G Background -> Blender world: color + screen-space image."""
+        m3g = self.m3g
+        widx = next((i for i in sorted(m3g.objects) if m3g.objects[i][0] == T_WORLD), None)
+        if widx is None:
+            return
+        wd = m3g.get(widx)
+        if wd is None or wd["type"] != T_WORLD or not wd["background"]:
+            return
+        bgd = m3g.get(wd["background"], T_BACKGROUND)
+        if bgd is None:
+            return
+        world = bpy.data.worlds.new("M3G_World")
+        world.use_nodes = True
+        nt = world.node_tree
+        bgn = next((n for n in nt.nodes if n.type == 'BACKGROUND'), None)
+        out = next((n for n in nt.nodes if n.type == 'OUTPUT_WORLD'), None)
+        if bgn is None:
+            bgn = nt.nodes.new("ShaderNodeBackground")
+            if out is None:
+                out = nt.nodes.new("ShaderNodeOutputWorld")
+            nt.links.new(bgn.outputs["Background"], out.inputs["Surface"])
+        color = rgb_lin(bgd["color"]) + (1.0,)
+        bgn.inputs["Color"].default_value = color
+        state = {"d": bgd, "nt": nt, "mapping": None, "size": None,
+                 "crop": bgd["crop"], "color_sock": (bgn, bgn.inputs["Color"])}
+        if bgd["image"]:
+            ref = m3g.resolve_image(bgd["image"])
+            info = self.get_image(ref[1], ref[0]) if ref is not None else None
+            if info is not None:
+                self.bg_image_nodes(nt, bgn, bgd, info, color, state)
+        self.bg = state
+        self.context.scene.world = world
+
+    def range_mask(self, nt, sock):
+        """1.0 where 0 < sock < 1, else 0.0 (Math nodes)."""
+        nodes, links = nt.nodes, nt.links
+        g = nodes.new("ShaderNodeMath")
+        g.operation = 'GREATER_THAN'
+        g.inputs[1].default_value = 0.0
+        lo = nodes.new("ShaderNodeMath")
+        lo.operation = 'LESS_THAN'
+        lo.inputs[1].default_value = 1.0
+        m = nodes.new("ShaderNodeMath")
+        m.operation = 'MULTIPLY'
+        links.new(sock, g.inputs[0])
+        links.new(sock, lo.inputs[0])
+        links.new(g.outputs[0], m.inputs[0])
+        links.new(lo.outputs[0], m.inputs[1])
+        return m
+
+    def bg_image_nodes(self, nt, bgn, bgd, info, color, state):
+        # Image drawn behind the scene; crop rect is in image pixels (origin
+        # top-left) and is stretched over the whole frame. Window coords (0..1,
+        # origin bottom-left) -> Mapping -> image UV. BORDER mode -> color outside.
+        cx, cy, cw, ch = bgd["crop"]
+        w, h = info["w"], info["h"]
+        if cw == 0:
+            cw = w
+        if ch == 0:
+            ch = h
+        state["crop"] = (cx, cy, cw, ch)
+        state["size"] = (w, h)
+        nodes, links = nt.nodes, nt.links
+        tc = nodes.new("ShaderNodeTexCoord")
+        mp = nodes.new("ShaderNodeMapping")
+        mp.vector_type = 'POINT'
+        mp.inputs["Location"].default_value = (cx / w, (h - cy - ch) / h, 0.0)
+        mp.inputs["Scale"].default_value = (cw / w, ch / h, 1.0)
+        tex = nodes.new("ShaderNodeTexImage")
+        tex.image = info["img"]
+        tex.interpolation = 'Closest'
+        tex.extension = 'REPEAT'
+        links.new(tc.outputs["Window"], mp.inputs["Vector"])
+        links.new(mp.outputs["Vector"], tex.inputs["Vector"])
+
+        flags = ((bgd["mode_x"] == 32, 'X'), (bgd["mode_y"] == 32, 'Y'))   # 32 = BORDER
+        masks = []
+        if any(f for f, _a in flags):
+            sep = nodes.new("ShaderNodeSeparateXYZ")
+            links.new(mp.outputs["Vector"], sep.inputs["Vector"])
+            for f, axis in flags:
+                if f:
+                    masks.append(self.range_mask(nt, sep.outputs[axis]))
+        mask = None
+        if masks:
+            mask = masks[0]
+            if len(masks) == 2:
+                mul = nodes.new("ShaderNodeMath")
+                mul.operation = 'MULTIPLY'
+                links.new(masks[0].outputs[0], mul.inputs[0])
+                links.new(masks[1].outputs[0], mul.inputs[1])
+                mask = mul
+        if mask is None:
+            links.new(tex.outputs["Color"], bgn.inputs["Color"])
+        else:
+            mix = nodes.new("ShaderNodeMix")
+            mix.data_type = 'RGBA'
+            mix.blend_type = 'MIX'
+            mix.inputs[6].default_value = color
+            links.new(mask.outputs[0], mix.inputs[0])
+            links.new(tex.outputs["Color"], mix.inputs[7])
+            links.new(mix.outputs[2], bgn.inputs["Color"])
+            state["color_sock"] = (mix, mix.inputs[6])
+        state["mapping"] = mp
+
+    # ---- animation --------------------------------------------------------
+    # One Blender action per AnimationController ("clip"). The first clip of
+    # each target is assigned, the others are kept with a fake user so they
+    # can be picked in the Action editor. Controller weight / active interval
+    # are ignored; speed and reference times are applied.
+
+    def group_tracks(self, track_ids):
+        groups = {}
+        for tid in track_ids:
+            tr = self.m3g.get(tid, T_TRACK)
+            if tr is None:
+                continue
+            seq = self.m3g.get(tr["seq"], T_KEYFRAMES)
+            if seq is None or len(seq["times"]) == 0:
+                continue
+            ctrl = self.m3g.get(tr["ctrl"], T_CONTROLLER) if tr["ctrl"] else None
+            groups.setdefault(tr["ctrl"], []).append((tr, seq, ctrl))
+        return groups
+
+    def keys(self, seq, ctrl):
+        """-> frames, values (n,c), blender interpolation, loop flag."""
+        n = len(seq["times"])
+        a, b = seq["first"], seq["last"]
+        if not (0 <= a <= b < n):
+            a, b = 0, n - 1
+        times = seq["times"][a:b + 1].astype(np.float64)
+        vals = seq["values"][a:b + 1].copy()
+        loop = seq["repeat"] == 193
+        dur = float(seq["duration"])
+        if loop and dur > 0.0 and times[0] + dur > times[-1] + 1e-9:
+            # M3G loops by interpolating last key -> first key shifted by duration
+            times = np.append(times, times[0] + dur)
+            vals = np.vstack([vals, vals[0:1]])
+        speed = ctrl["speed"] if (ctrl is not None and ctrl["speed"] > 0.0) else 1.0
+        refs = ctrl["refseq"] if ctrl is not None else 0.0
+        refw = ctrl["refworld"] if ctrl is not None else 0
+        world_ms = refw + (times - refs) / speed
+        frames = self.frame0 + world_ms * (self.fps / 1000.0)
+        self.anim_state["last"] = max(self.anim_state["last"], float(frames[-1]))
+        return frames, vals, INTERP.get(seq["interp"], 'LINEAR'), loop
+
+    def add_fcurve(self, act, path, index, frames, vals, interp, loop):
+        try:
+            fc = act.fcurves.new(data_path=path, index=index)
+        except RuntimeError:
+            self.warn("Duplicate animation channel %s[%d] skipped" % (path, index))
+            return
+        n = len(frames)
+        fc.keyframe_points.add(n)
+        co = np.empty(2 * n, dtype=np.float32)
+        co[0::2] = frames
+        co[1::2] = vals
+        fc.keyframe_points.foreach_set("co", co)
+        for kp in fc.keyframe_points:
+            kp.interpolation = interp
+            if interp == 'BEZIER':
+                kp.handle_left_type = 'AUTO'
+                kp.handle_right_type = 'AUTO'
+        fc.update()
+        if loop:
+            fc.modifiers.new('CYCLES')
+
+    def run_clips(self, name, ids, groups, channel_fn):
+        assigned = set()
+        for cidx in sorted(groups):
+            acts = {}
+            for tr, seq, ctrl in groups[cidx]:
+                for (tk, path, index, frames, vals, interp, loop) in channel_fn(tr, seq, ctrl):
+                    if tk not in ids:
+                        continue
+                    act = acts.get(tk)
+                    if act is None:
+                        act = bpy.data.actions.new(
+                            "M3G_%s_c%d%s" % (name, cidx, "" if tk == 'obj' else "_" + tk))
+                        acts[tk] = act
+                    self.add_fcurve(act, path, index, frames, vals, interp, loop)
+            for tk, act in acts.items():
+                if tk not in assigned:
+                    assign_action(ids[tk], act)
+                    assigned.add(tk)
+                else:
+                    act.use_fake_user = True
+
+    def node_channels(self, d, obj, tr, seq, ctrl):
+        prop = tr["prop"]
+        t = d["type"]
+        cam_like = t in (T_CAMERA, T_LIGHT)
+        frames, vals, interp, loop = self.keys(seq, ctrl)
+        c = vals.shape[1]
+        out = []
+
+        def add(target, path, arrays):
+            for i, a in enumerate(arrays):
+                out.append((target, path, i, frames, a, interp, loop))
+
+        data = obj.data
+        if prop == P_TRANSLATION and c >= 3:
+            loc = self.conv(vals[:, :3]) * self.scale
+            add('obj', "location", [loc[:, 0], loc[:, 1], loc[:, 2]])
+        elif prop == P_ORIENTATION and c >= 4:
+            q = vals[:, [3, 0, 1, 2]].copy()           # (x,y,z,w) -> (w,x,y,z)
+            nrm = np.linalg.norm(q, axis=1, keepdims=True)
+            nrm[nrm == 0] = 1.0
+            q = q / nrm
+            if self.z_up:
+                h = math.sqrt(0.5)
+                qc = np.tile([h, h, 0.0, 0.0], (len(q), 1))
+                qci = np.tile([h, -h, 0.0, 0.0], (len(q), 1))
+                q = qmul(qc, q)
+                if not cam_like:
+                    q = qmul(q, qci)
+            for i in range(1, len(q)):
+                if np.dot(q[i - 1], q[i]) < 0.0:
+                    q[i] = -q[i]
+            add('obj', "rotation_quaternion", [q[:, k] for k in range(4)])
+        elif prop == P_SCALE and c >= 1:
+            sc = np.repeat(vals[:, :1], 3, axis=1) if c < 3 else vals[:, :3]
+            if self.z_up and not cam_like:
+                sc = sc[:, [0, 2, 1]]
+            add('obj', "scale", [sc[:, 0], sc[:, 1], sc[:, 2]])
+        elif t == T_CAMERA and prop == P_FOV and c >= 1 and data is not None:
+            sh = getattr(data, "sensor_height", 24.0)
+            fov = np.clip(vals[:, 0], 0.1, 179.0)
+            add('data', "lens", [sh / (2.0 * np.tan(np.radians(fov) / 2.0))])
+        elif t == T_CAMERA and prop == P_NEAR and c >= 1:
+            add('data', "clip_start", [np.maximum(vals[:, 0] * self.scale, 1e-4)])
+        elif t == T_CAMERA and prop == P_FAR and c >= 1:
+            add('data', "clip_end", [vals[:, 0] * self.scale])
+        elif t == T_LIGHT and prop == P_COLOR and c >= 3 and data is not None:
+            col = lin_np(np.clip(vals[:, :3], 0.0, 1.0))
+            add('data', "color", [col[:, 0], col[:, 1], col[:, 2]])
+        elif t == T_LIGHT and prop == P_INTENSITY and c >= 1 and data is not None:
+            k = 1.0 if getattr(data, "type", "") == 'SUN' else 1000.0
+            add('data', "energy", [np.maximum(vals[:, 0], 0.0) * k])
+        elif t == T_LIGHT and prop == P_SPOT_ANGLE and c >= 1 and data is not None:
+            add('data', "spot_size", [np.radians(np.clip(vals[:, 0] * 2.0, 1.0, 180.0))])
+        else:
+            self.warn_once(("prop", prop, t),
+                           "Animation property %d on node type %d not supported" % (prop, t))
+        return out
+
+    def bg_channels(self, tr, seq, ctrl):
+        bg = self.bg
+        prop = tr["prop"]
+        frames, vals, interp, loop = self.keys(seq, ctrl)
+        c = vals.shape[1]
+        out = []
+        base = 'nodes["%s"].inputs[%d].default_value'
+        if prop == P_CROP and bg["mapping"] is not None and c >= 2:
+            w, h = bg["size"]
+            cx, cy = vals[:, 0], vals[:, 1]
+            cw = vals[:, 2] if c >= 4 else np.full(len(cx), float(bg["crop"][2]))
+            ch = vals[:, 3] if c >= 4 else np.full(len(cx), float(bg["crop"][3]))
+            mp = bg["mapping"]
+            li = socket_index(mp, mp.inputs["Location"])
+            si = socket_index(mp, mp.inputs["Scale"])
+            out.append(('nt', base % (mp.name, li), 0, frames, cx / w, interp, loop))
+            out.append(('nt', base % (mp.name, li), 1, frames, (h - cy - ch) / h, interp, loop))
+            if c >= 4:
+                out.append(('nt', base % (mp.name, si), 0, frames, cw / w, interp, loop))
+                out.append(('nt', base % (mp.name, si), 1, frames, ch / h, interp, loop))
+        elif prop == P_COLOR and c >= 3:
+            node, sock = bg["color_sock"]
+            si = socket_index(node, sock)
+            col = lin_np(np.clip(vals[:, :3], 0.0, 1.0))
+            for i in range(3):
+                out.append(('nt', base % (node.name, si), i, frames, col[:, i], interp, loop))
+            if c >= 4:
+                out.append(('nt', base % (node.name, si), 3, frames, vals[:, 3], interp, loop))
+        elif prop == P_CROP:
+            self.warn_once(("bgcrop",), "Background crop animation skipped (no background image loaded)")
+        else:
+            self.warn_once(("bgprop", prop), "Background animation property %d not supported" % prop)
+        return out
+
+    def animate_node(self, idx, obj):
+        d = self.m3g.get(idx)
+        if d is None or not d.get("tracks"):
+            return
+        groups = self.group_tracks(d["tracks"])
+        if not groups:
+            return
+        ids = {'obj': obj}
+        if d["type"] in (T_CAMERA, T_LIGHT) and obj.data is not None:
+            ids['data'] = obj.data
+        self.run_clips(obj.name, ids, groups,
+                       lambda tr, seq, ctrl: self.node_channels(d, obj, tr, seq, ctrl))
+
+    def animate_all(self):
+        for idx, obj in list(self.node_objs.items()):
+            try:
+                self.animate_node(idx, obj)
+            except Exception as e:
+                self.warn("Animation of node %d failed: %s" % (idx, e))
+        if self.bg is not None and self.bg["d"].get("tracks"):
+            try:
+                groups = self.group_tracks(self.bg["d"]["tracks"])
+                self.run_clips("Background", {'nt': self.bg["nt"]}, groups, self.bg_channels)
+            except Exception as e:
+                self.warn("Background animation failed: %s" % e)
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1811,18 @@ class IMPORT_OT_m3g(bpy.types.Operator, ImportHelper):
     y_up_to_z_up: BoolProperty(
         name="Y-up to Z-up", description="Convert M3G (Y-up) to Blender (Z-up)",
         default=True)
+    import_animation: BoolProperty(
+        name="Animation",
+        description="Import keyframe animation (one action per controller)",
+        default=True)
+    import_background: BoolProperty(
+        name="Background",
+        description="Set the scene World from the M3G Background (color + image)",
+        default=True)
+    load_external: BoolProperty(
+        name="Load external files",
+        description="Load files referenced by the .m3g if they sit next to it",
+        default=True)
 
     def execute(self, context):
         try:
@@ -1112,9 +1833,11 @@ class IMPORT_OT_m3g(bpy.types.Operator, ImportHelper):
         try:
             with open(self.filepath, "rb") as f:
                 data = f.read()
-            m3g = M3GFile(data)
+            m3g = M3GFile(data, path=self.filepath, allow_external=self.load_external)
             imp = Importer(m3g, context, self.y_up_to_z_up, self.global_scale,
-                           os.path.splitext(os.path.basename(self.filepath))[0])
+                           os.path.splitext(os.path.basename(self.filepath))[0],
+                           import_animation=self.import_animation,
+                           import_background=self.import_background)
             count = imp.run()
         except M3GError as e:
             self.report({'ERROR'}, "M3G: %s" % e)
@@ -1122,6 +1845,8 @@ class IMPORT_OT_m3g(bpy.types.Operator, ImportHelper):
         except OSError as e:
             self.report({'ERROR'}, "Cannot read file: %s" % e)
             return {'CANCELLED'}
+        for note in m3g.notes:
+            self.report({'INFO'}, note)
         for w in m3g.warnings[:10]:
             self.report({'WARNING'}, w)
         if len(m3g.warnings) > 10:

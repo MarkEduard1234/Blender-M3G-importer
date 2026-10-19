@@ -15,3 +15,6 @@ Burning Tires✅
 Air Buster 3D✅
 Colin McRae - DiRT 3D✅
 The Fast and The Furious - Pink Slip 3D✅
+
+**TESTED BLENDER VERSION (WORKING)**
+Blender 2.8, 2.83, 3.6, 4.5, 5.0
